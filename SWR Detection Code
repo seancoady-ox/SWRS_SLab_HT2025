@@ -1,0 +1,577 @@
+import os
+
+from scipy import stats
+import pandas as pd
+import scipy
+import scipy.signal
+import numpy as np
+import matplotlib.pyplot as plt
+
+
+# Function to find onset and offset indices of logical crossings in a binary signal
+
+def logic_cross(logic):
+    """
+        Identifies the indices where the binary signal crosses from 0 to 1 (onset)
+        and 1 to 0 (offset).
+
+        Parameters:
+            logic (array-like): Binary input signal.
+
+        Returns:
+            onset (ndarray): Indices of rising edges (0 -> 1 transitions).
+            offset (ndarray): Indices of falling edges (1 -> 0 transitions).
+        """
+    onset = np.where(np.diff(logic.astype('int8')) == 1)[0]  # Rising edge
+    offset = np.where(np.diff(logic.astype('int8')) == -1)[0]  # Falling edge
+
+    # Ensure balanced onset and offset counts
+    if onset.shape[0] > offset.shape[0]:
+        onset = onset[0:-1]  # Remove incomplete crossings at the end
+    if offset.shape[0] > onset.shape[0]:
+        offset = offset[1:]  # Remove incomplete crossings at the beginning
+
+    # Ensure proper alignment of onset and offset
+    if onset[0] > offset[0]:
+        onset = onset[0:-1]
+        offset = offset[1:]
+
+    return onset, offset
+
+
+# Function to detect threshold crossings in a signal
+def threshold_cross(signal, threshold):
+    """
+    Detects the indices where the signal crosses above a specified threshold.
+
+    Parameters:
+        signal (array-like): Input signal.
+        threshold (float): Threshold value for detection.
+
+    Returns:
+        onset (ndarray): Indices where the signal rises above the threshold.
+        offset (ndarray): Indices where the signal falls below the threshold.
+    """
+    over_thresh = signal > threshold  # Boolean array where signal exceeds threshold
+    onset, offset = logic_cross(over_thresh)
+    onset += 1  # Adjust indices to match threshold crossing
+    offset += 1
+    return onset, offset
+
+
+# Function to z-score normalize a signal
+def zscore(x, axis=0):
+    """
+    Computes the z-score normalization of an input array.
+
+    Parameters:
+        x (array-like): Input data.
+        axis (int): Axis along which to compute the z-score.
+
+    Returns:
+        zscored (ndarray): Z-score normalized array.
+    """
+    return (x - x.mean(axis=axis)) / x.std(axis=axis)
+
+
+# Function to apply a bandpass Butterworth filter with zero phase shift
+def butter_filtfilt(lfp, low, high, sample_rate, order= 2):
+    """
+    Filters the signal using a bandpass Butterworth filter.
+
+    Parameters:
+        lfp (array-like): Input signal.
+        low (float): Low cutoff frequency.
+        high (float): High cutoff frequency.
+        sample_rate (float): Sampling rate of the signal.
+        order (int): Filter order.
+
+    Returns:
+        filtered_lfp (ndef butter_filtfilt(lfp, low, high, sample_rate, order= 2):
+    """
+
+    """
+    normalised_low_cut = low / (sample_rate / 2)
+    normalised_high_cut = high / (sample_rate / 2)
+    [b_bandpass, a_bandpass] = scipy.signal.butter(order, [normalised_low_cut, normalised_high_cut], btype='band')
+    filtered_lfp = scipy.signal.filtfilt(b_bandpass, a_bandpass, lfp, axis=0)
+    return filtered_lfpdarray): Bandpass filtered signal.
+    """
+    normalised_low_cut = low / (sample_rate / 2)
+    normalised_high_cut = high / (sample_rate / 2)
+    [b_bandpass, a_bandpass] = scipy.signal.butter(order, [normalised_low_cut, normalised_high_cut], btype='band')
+    filtered_lfp = scipy.signal.filtfilt(b_bandpass, a_bandpass, lfp, axis=0)
+    return filtered_lfp
+
+def nonTheta_butter_filtfilt(lfp, low, high, sample_rate = 1000, order = 2, notch_low = 5, notch_high = 10):
+    normalised_low_cut = low / (sample_rate / 2)
+    normalised_high_cut = high / (sample_rate / 2)
+
+    normalized_low_notch = notch_low / (sample_rate / 2)
+    normalized_high_notch = notch_high / (sample_rate / 2)
+
+    [b_bandpass, a_bandpass] = scipy.signal.butter(order, [normalised_low_cut, normalised_high_cut], btype = 'band')
+    [b_bandstop, a_bandstop] = scipy.signal.butter(order, [normalized_low_notch, normalized_high_notch],  btype = 'bandstop')
+
+    filtered_lfp = scipy.signal.filtfilt(b_bandpass, a_bandpass, lfp, axis = 0)
+    filtered_lfp = scipy.signal.filtfilt(b_bandstop, a_bandstop, filtered_lfp, axis = 0)
+
+    return filtered_lfp
+
+
+# Function to remove short intervals between detected events
+def min_ripple_interval_remove(onset, offset, min_gap):
+    """
+    Removes events with intervals shorter than a specified minimum gap.
+
+    Parameters:
+        onset (ndarray): Onset indices of events.
+        offset (ndarray): Offset indices of events.
+        min_gap (float): Minimum gap allowed between events.
+
+    Returns:
+        onset_rem (list): Filtered onset indices.
+        offset_rem (list): Filtered offset indices.
+    """
+    onset_rem = []
+    offset_rem = []
+    for i, off in enumerate(offset[:-1]):
+        if i == 0:
+            onset_rem.append(onset[i])
+        if (onset[i + 1] - off) < min_gap:
+            if i == (offset.size - 2):
+                offset_rem.append(offset[i + 1])
+            continue
+        offset_rem.append(off)
+        onset_rem.append(onset[i + 1])
+        if i == (offset.size - 2):
+            offset_rem.append(offset[i + 1])
+    return onset_rem, offset_rem
+
+
+
+def ripple_detection(
+        lfp, low=120, high=200, down_sampled_sr=1000, order=3,
+        min_duration1=0, min_duration2=0.015, max_duration=0.25,
+        low_threshold=1, high_threshold=3, min_gap=0.03, mean_threshold=0
+):
+    """
+    Detects sharp wave ripples (SWR) from local field potentials (LFPs).
+
+    Parameters:
+        lfp (array-like): Input LFP signal.
+        low, high (float): Bandpass filter cutoff frequencies.
+        down_sampled_sr (float): Downsampled sampling rate.
+        order (int): Filter order.
+        min_duration1, min_duration2, max_duration (float): Duration constraints for events.
+        low_threshold, high_threshold (float): Thresholds for event detection.
+        min_gap (float): Minimum interval between events.
+        mean_threshold (float): Threshold for mean RMS values.
+
+    Returns:
+        onset (ndarray): Onset indices of detected SWRs.
+        offset (ndarray): Offset indices of detected SWRs.
+        mean_rms (ndarray): Mean RMS values of detected events.
+    """
+    # Define smoothing window size based on sampling rate
+    window_limit = np.round(down_sampled_sr / 1250 * 11).astype('int')
+
+    # Bandpass filter the signal
+    signal = butter_filtfilt(lfp, low, high, down_sampled_sr, order=order)
+
+    # Compute the RMS of the filtered signal
+    rms = signal ** 2
+    window = np.ones(window_limit) / window_limit
+    rms = scipy.signal.convolve(rms, window, mode='same')
+
+    # Normalize RMS using z-score
+    rms = zscore(rms)
+
+    # Detect events crossing the low threshold
+    onset, offset = threshold_cross(rms, low_threshold)
+
+    # Filter events based on duration and minimum gap
+    min_interval = min_gap * down_sampled_sr
+    long_enough = (offset - onset) > (min_duration1 * down_sampled_sr)
+    onset, offset = onset[long_enough], offset[long_enough]
+    onset, offset = min_ripple_interval_remove(onset, offset, min_interval)
+    onset, offset = np.array(onset), np.array(offset)
+
+    # Apply additional duration constraints
+    long_enough = (offset - onset) > (min_duration2 * down_sampled_sr)
+    short_enough = (offset - onset) < (max_duration * down_sampled_sr)
+    onset, offset = onset[long_enough & short_enough], offset[long_enough & short_enough]
+
+    # Compute mean RMS for each event
+    mean_rms = np.zeros(onset.size)
+    for i, on_off in enumerate(zip(onset, offset)):
+        mean_rms[i] = np.mean(rms[range(on_off[0] + 1, on_off[1] - 1)])
+
+    # Filter events based on mean RMS threshold
+    mean_above_thresh = mean_rms > mean_threshold
+    onset, offset, mean_rms = onset[mean_above_thresh], offset[mean_above_thresh], mean_rms[mean_above_thresh]
+
+    # Compute peak RMS for each event and filter by high threshold
+    peak_rms = np.zeros(onset.size)
+    for i, on_off in enumerate(zip(onset, offset)):
+        peak_rms[i] = np.max(rms[range(on_off[0], on_off[1])])
+    above_peak = peak_rms > high_threshold
+    onset, offset, mean_rms = onset[above_peak], offset[above_peak], mean_rms[above_peak]
+
+    return onset, offset
+
+def compute_ripple_frequency(signal, sample_rate):
+    """Computes the dominant frequency of a ripple event using FFT."""
+    freqs, psd = scipy.signal.welch(signal, fs=sample_rate, nperseg=len(signal))  # Power Spectral Density (PSD)
+    return freqs[np.argmax(psd)]  # Return frequency with max power
+
+
+def analyze_swr_features(lfp, spikes_array, ripple_onsets, ripple_offsets, sample_rate=1000):
+    """
+    Extracts features from detected ripples: frequency, sharp wave envelope, and minimum deflections.
+
+    Args:
+        lfp (np.array): Original LFP signal.
+        ripple_onsets (list or np.array): Indices of ripple start points.
+        ripple_offsets (list or np.array): Indices of ripple end points.
+        sample_rate (int): Sampling rate in Hz (default 1000).
+
+    Returns:
+        ripple_frequencies (np.array): Frequencies of each ripple.
+        max_spw_envelope_values (np.array): Maximum SPW envelope values in ripple range.
+        mean_spw_envelope (np.array): Minimum raw LFP values in ripple range.
+    """
+
+    # Bandpass filtering
+    ripple_signal = butter_filtfilt(lfp, 120, 200, sample_rate, order=3)  # Ripple Band (120-200 Hz)
+    ripple_hilbert = np.abs(scipy.signal.hilbert(ripple_signal))
+
+    spw_signal = butter_filtfilt(lfp, 4, 20, sample_rate, order=2)  # Sharp Wave Band (4-20 Hz)
+
+    theta_signal = butter_filtfilt(lfp, 6, 12, sample_rate, order = 2)
+
+    # Compute Hilbert Transform for envelope detection
+    spw_envelope = np.abs(scipy.signal.hilbert(spw_signal))
+
+    theta_envelope = np.abs(scipy.signal.hilbert(theta_signal))
+
+    theta_smoothed = scipy.signal.convolve(theta_envelope, np.ones(1000) / 1000, mode='same')
+
+    ratio = spw_envelope / theta_smoothed
+
+    thetaZscore = (theta_envelope - np.mean(theta_envelope)) / (np.std(theta_envelope))
+
+    nonZeroTheta = thetaZscore < 0
+    ratioLogic = ratio > 2
+
+    low_Theta_Per_Second = (nonZeroTheta & ratioLogic).sum() / 1000
+
+    ripple_durations = []
+    ripple_frequencies = []
+    max_spw_envelope_values = []
+    mean_theta_env_values = []
+    mean_spw_envelope = []
+    ripple_env = []
+    mean_spiking_values = []
+
+    for onset, offset in zip(ripple_onsets, ripple_offsets):
+        # Extract Ripple Frequency
+        ripple_length = offset - onset
+        ripple_durations.append(ripple_length)
+
+        ripple_segment = ripple_signal[onset:offset]
+
+        ripple_frequencies.append(compute_ripple_frequency(ripple_segment, sample_rate))
+
+        ripple_env.append(np.mean(ripple_hilbert[onset-500:offset+500]))
+
+        # Extract Max Envelope of SPW Band
+        max_spw_envelope_values.append(np.max(spw_envelope[onset:offset]))
+
+        #Extract Max Theta Activity
+        before = np.mean(theta_envelope[onset - 500:onset])
+        after = np.mean(theta_envelope[offset:offset + 500])
+        mean_theta_env_values.append(np.mean([before, after]))
+
+        # Extract Mean in th "SPW envelope" in Raw LFP
+        mean_spw_envelope.append(np.mean(spw_envelope[onset:offset]))
+
+        # Extract the mean firing rate
+        mean_spiking_values.append(np.mean(spikes_array[onset:offset]))
+
+    return np.array(ripple_durations), np.array(ripple_frequencies), np.array(max_spw_envelope_values), np.array(mean_spw_envelope), np.array(mean_theta_env_values), np.array(ripple_env), np.array(mean_spiking_values), theta_envelope, ripple_signal, low_Theta_Per_Second
+
+noStim_filenames = []
+noStim_timeLowTheta = []
+noStim_stimPhase = []
+noStim_rippleDurations = []
+noStim_ratio = []
+noStim_theta_zscore = []
+noStim_n_ripple = []
+noStim_ripple_frequencies = []
+noStim_max_SPW_envelope_values = []
+noStim_mean_theta_env_values = []
+noStim_min_deflections = []
+noStim_ripple_env = []
+noStim_mean_spiking_values = []
+
+openStim_filenames = []
+openStim_timeLowTheta = []
+openStim_stimPhase = []
+openStim_rippleDurations = []
+openStim_ratio = []
+openStim_theta_zscore = []
+openStim_n_ripple = []
+openStim_ripple_frequencies = []
+openStim_max_SPW_envelope_values = []
+openStim_mean_theta_env_values = []
+openStim_min_deflections = []
+openStim_ripple_env = []
+openStim_mean_spiking_values = []
+
+closedStim_filenames = []
+closedStim_timeLowTheta = []
+closedStim_stimPhase = []
+closedStim_rippleDurations = []
+closedStim_ratio = []
+closedStim_theta_zscore = []
+closedStim_n_ripple = []
+closedStim_ripple_frequencies = []
+closedStim_max_SPW_envelope_values = []
+closedStim_mean_theta_env_values = []
+closedStim_min_deflections = []
+closedStim_ripple_env = []
+closedStim_mean_spiking_values = []
+
+# Define the base directory
+base_directory = "sean_data_with_stim"
+
+iterator = 0
+
+# Walk through all subdirectories and files
+for root, _, files in os.walk(base_directory):
+    for file in files:
+        if file.endswith(".csv"):  # Ensure it's a CSV file
+
+            file = file.strip()
+            filepath = os.path.join(root, file)
+
+            # Ensure the file exists before processing
+            if not os.path.exists(filepath):
+                print(f"File not found: {filepath}")
+                continue
+
+            # Process based on file type
+            if "no stim" in file:
+                print(f"Processing no stim file: {filepath}")
+                ephys_tbl_noStim = pd.read_csv(filepath)
+                aggregate_lfp_array = np.array(ephys_tbl_noStim['LFP'])
+                spike_array = ephys_tbl_noStim['firing rate']
+                # print(f" no stim LFP Data Shape: {aggregate_lfp_array.shape}")
+                # print(f" no stim Spike Data Shape: {spike_array.shape}")
+
+                ronsets, roffsets = ripple_detection(aggregate_lfp_array)
+
+                all_ripple_durations, all_ripple_frequencies, all_max_SPW_env, all_mean_SPW_envelopes, all_mean_theta_envValues, all_rippleEnvValues, all_mean_spikes, theta_env, rip_sig, timeLowTheta = analyze_swr_features(
+                    aggregate_lfp_array, spike_array, ronsets, roffsets)
+
+                ratio = all_mean_SPW_envelopes / all_mean_theta_envValues
+                theta_zscore = (all_mean_theta_envValues - theta_env.mean()) / theta_env.std()  # moved to Z score to get an idea
+                low_theta = theta_zscore < 0
+                high_spike = (all_mean_spikes / spike_array.mean()) > 2
+                logic = (ratio > 2) & high_spike #& low_theta
+                indices = np.where(logic)[0]
+                number_of_swr = len(indices)
+                # print(str(number_of_swr) + " SWRs recorded in the no stim file")
+                if file.endswith("_0.csv"):
+                    noStim_stimPhase.append(0)
+                    print(0)
+                elif file.endswith("_90.csv"):
+                    noStim_stimPhase.append(90)
+                    print(90)
+                elif file.endswith("_180.csv"):
+                    noStim_stimPhase.append(180)
+                    print(180)
+                else:
+                    noStim_stimPhase.append(270)
+                    print(270)
+
+                noStim_filenames.append(file)
+                noStim_timeLowTheta.append(timeLowTheta)
+                noStim_rippleDurations.append(np.mean(all_ripple_durations[indices]))
+                noStim_ratio.append(np.mean(ratio[indices]))
+                noStim_theta_zscore.append(np.mean(theta_zscore[indices]))
+                noStim_n_ripple.append(len(indices))  # Number of valid ripples
+                noStim_ripple_frequencies.append(np.mean(all_ripple_frequencies[indices]))
+                noStim_max_SPW_envelope_values.append(np.mean(all_max_SPW_env[indices]))
+                noStim_mean_theta_env_values.append(np.mean(all_mean_theta_envValues[indices]))
+                noStim_min_deflections.append(np.mean(all_mean_SPW_envelopes[indices]))
+                noStim_ripple_env.append(np.mean(all_rippleEnvValues[indices]))
+                noStim_mean_spiking_values.append(np.mean(all_mean_spikes[indices]))
+
+                iterator += 1
+
+
+            elif "closed" in file:
+                print(f"Processing closed stim file: {filepath}")
+                ephys_tbl_closedStim = pd.read_csv(filepath)
+                aggregate_lfp_array = np.array(ephys_tbl_closedStim['LFP'])
+                spike_array = ephys_tbl_closedStim['firing rate']
+                # print(f" closed LFP Data Shape: {aggregate_lfp_array.shape}")
+                # print(f" closed Spike Data Shape: {spike_array.shape}")
+
+                ronsets, roffsets = ripple_detection(aggregate_lfp_array)
+
+                all_ripple_durations, all_ripple_frequencies, all_max_SPW_env, all_mean_SPW_envelopes, all_mean_theta_envValues, all_rippleEnvValues, all_mean_spikes, theta_env, rip_sig, timeLowTheta = analyze_swr_features(
+                    aggregate_lfp_array, spike_array, ronsets, roffsets)
+
+                ratio = all_mean_SPW_envelopes / all_mean_theta_envValues
+                theta_zscore = (all_mean_theta_envValues - theta_env.mean()) / theta_env.std()  # moved to Z score to get an idea
+                low_theta = theta_zscore < 0
+                high_spike = (all_mean_spikes / spike_array.mean()) > 2
+                logic = (ratio > 2) & high_spike #& low_theta
+                indices = np.where(logic)[0]
+                number_of_swr = len(indices)
+                # print(str(number_of_swr) + " SWRs recorded in the closed stim file")
+                if file.endswith("_0.csv"):
+                    closedStim_stimPhase.append(0)
+                    print(0)
+                elif file.endswith("_90.csv"):
+                    closedStim_stimPhase.append(90)
+                    print(90)
+                elif file.endswith("_180.csv"):
+                    closedStim_stimPhase.append(180)
+                    print(180)
+                else:
+                    closedStim_stimPhase.append(270)
+                    print(270)
+
+                closedStim_filenames.append(file)
+                closedStim_timeLowTheta.append(timeLowTheta)
+                closedStim_rippleDurations.append(np.mean(all_ripple_durations[indices]))
+                closedStim_ratio.append(np.mean(ratio[indices]))
+                closedStim_theta_zscore.append(np.mean(theta_zscore[indices]))
+                closedStim_n_ripple.append(len(indices))  # Number of valid ripples
+                closedStim_ripple_frequencies.append(np.mean(all_ripple_frequencies[indices]))
+                closedStim_max_SPW_envelope_values.append(np.mean(all_max_SPW_env[indices]))
+                closedStim_mean_theta_env_values.append(np.mean(all_mean_theta_envValues[indices]))
+                closedStim_min_deflections.append(np.mean(all_mean_SPW_envelopes[indices]))
+                closedStim_ripple_env.append(np.mean(all_rippleEnvValues[indices]))
+                closedStim_mean_spiking_values.append(np.mean(all_mean_spikes[indices]))
+
+                iterator += 1
+
+            elif "open" in file:
+                print(f"Processing open stim file: {filepath}")
+                ephys_tbl_openStim = pd.read_csv(filepath)
+                aggregate_lfp_array = np.array(ephys_tbl_openStim['LFP'])
+                spike_array = ephys_tbl_openStim['firing rate']
+                # print(f" open LFP Data Shape: {aggregate_lfp_array.shape}")
+                # print(f" open Spike Data Shape: {spike_array.shape}")
+
+                ronsets, roffsets = ripple_detection(aggregate_lfp_array)
+
+                all_ripple_durations, all_ripple_frequencies, all_max_SPW_env, all_mean_SPW_envelopes, all_mean_theta_envValues, all_rippleEnvValues, all_mean_spikes, theta_env, rip_sig, timeLowTheta = analyze_swr_features(
+                    aggregate_lfp_array, spike_array, ronsets, roffsets)
+
+                ratio = all_mean_SPW_envelopes / all_mean_theta_envValues
+                theta_zscore = (all_mean_theta_envValues - theta_env.mean()) / theta_env.std()
+                low_theta = theta_zscore < 0
+                high_spike = (all_mean_spikes / spike_array.mean()) > 2
+                logic = (ratio > 2) & high_spike #& low_theta
+                indices = np.where(logic)[0]
+                number_of_swr = len(indices)
+                # print(str(number_of_swr) + " SWRs recorded in the open stim file")
+                if file.endswith("_0.csv"):
+                    openStim_stimPhase.append(0)
+                    print(0)
+                elif file.endswith("_90.csv"):
+                    openStim_stimPhase.append(90)
+                    print(90)
+                elif file.endswith("_180.csv"):
+                    openStim_stimPhase.append(180)
+                    print(180)
+                else:
+                    openStim_stimPhase.append(270)
+                    print(270)
+
+                openStim_filenames.append(file)
+                openStim_timeLowTheta.append(timeLowTheta)
+                openStim_rippleDurations.append(np.mean(all_ripple_durations[indices]))
+                openStim_ratio.append(np.mean(ratio[indices]))
+                openStim_theta_zscore.append(np.mean(theta_zscore[indices]))
+                openStim_n_ripple.append(len(indices))  # Number of valid ripples
+                openStim_ripple_frequencies.append(np.mean(all_ripple_frequencies[indices]))
+                openStim_max_SPW_envelope_values.append(np.mean(all_max_SPW_env[indices]))
+                openStim_mean_theta_env_values.append(np.mean(all_mean_theta_envValues[indices]))
+                openStim_min_deflections.append(np.mean(all_mean_SPW_envelopes[indices]))
+                openStim_ripple_env.append(np.mean(all_rippleEnvValues[indices]))
+                openStim_mean_spiking_values.append(np.mean(all_mean_spikes[indices]))
+
+                iterator += 1
+
+print(f"Processed {iterator} files.")
+
+noStim_df = pd.DataFrame({
+    'Filename': noStim_filenames,
+    'Time High Theta (Per Second)': noStim_timeLowTheta,
+    'Stimulus Phase': noStim_stimPhase,
+    'Mean Ripple Duration': noStim_rippleDurations,
+    'Mean Ratio': noStim_ratio,
+    'Mean Theta Z-score': noStim_theta_zscore,
+    'Number of Ripples': noStim_n_ripple,
+    'Mean Ripple Frequency (Hz)': noStim_ripple_frequencies,
+    'Max SPW Envelope Value': noStim_max_SPW_envelope_values,
+    'Mean Theta Envelope Value': noStim_mean_theta_env_values,
+    'Min Deflections': noStim_min_deflections,
+    'Ripple Envelope Value': noStim_ripple_env,
+    'Mean Spiking Value': noStim_mean_spiking_values
+})
+
+openStim_df = pd.DataFrame({
+    'Filename': openStim_filenames,
+    'Time High Theta (Per Second)': openStim_timeLowTheta,
+    'Stimulus Phase': openStim_stimPhase,
+    'Mean Ripple Duration': openStim_rippleDurations,
+    'Mean Ratio': openStim_ratio,
+    'Mean Theta Z-score': openStim_theta_zscore,
+    'Number of Ripples': openStim_n_ripple,
+    'Mean Ripple Frequency (Hz)': openStim_ripple_frequencies,
+    'Max SPW Envelope Value': openStim_max_SPW_envelope_values,
+    'Mean Theta Envelope Value': openStim_mean_theta_env_values,
+    'Min Deflections': openStim_min_deflections,
+    'Ripple Envelope Value': openStim_ripple_env,
+    'Mean Spiking Value': openStim_mean_spiking_values
+})
+
+closedStim_df = pd.DataFrame({
+    'Filename': closedStim_filenames,
+    'Time High Theta (Per Second)': closedStim_timeLowTheta,
+    'Stimulus Phase': closedStim_stimPhase,
+    'Mean Ripple Duration': closedStim_rippleDurations,
+    'Mean Ratio': closedStim_ratio,
+    'Mean Theta Z-score': closedStim_theta_zscore,
+    'Number of Ripples': closedStim_n_ripple,
+    'Mean Ripple Frequency (Hz)': closedStim_ripple_frequencies,
+    'Max SPW Envelope Value': closedStim_max_SPW_envelope_values,
+    'Mean Theta Envelope Value': closedStim_mean_theta_env_values,
+    'Min Deflections': closedStim_min_deflections,
+    'Ripple Envelope Value': closedStim_ripple_env,
+    'Mean Spiking Value': closedStim_mean_spiking_values
+})
+
+# Combine the three DataFrames into one final DataFrame
+final_df = pd.concat([noStim_df.assign(Condition="No Stim"),
+                      openStim_df.assign(Condition="Open Stim"),
+                      closedStim_df.assign(Condition="Closed Stim")],
+                     ignore_index=True)
+
+# Optionally, sort or reorder the columns as needed
+final_df = final_df[['Condition', 'Stimulus Phase', 'Mean Ripple Duration','Filename', 'Time High Theta (Per Second)', 'Mean Ratio', 'Mean Theta Z-score', 'Number of Ripples',
+                     'Mean Ripple Frequency (Hz)', 'Max SPW Envelope Value', 'Mean Theta Envelope Value',
+                     'Min Deflections', 'Ripple Envelope Value', 'Mean Spiking Value']]
+
+# Display the final table
+print(final_df)
+
+
